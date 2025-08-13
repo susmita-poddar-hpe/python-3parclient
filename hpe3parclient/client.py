@@ -31,6 +31,9 @@ import re
 import time
 import uuid
 import logging
+import ast
+
+from oslo_serialization import base64
 
 try:
     # For Python 3.0 and later
@@ -204,6 +207,40 @@ class HPE3ParClient(object):
 
     DEFAULT_NVME_PORT = 4420
     DEFAULT_PORT_NQN = 'nqn.2014-08.org.nvmexpress.discovery'
+
+    hpe3par_valid_keys = ['cpg', 'snap_cpg', 'provisioning', 'persona', 'vvs',
+                          'flash_cache', 'compression', 'group_replication',
+                          'convert_to_base']
+    
+    # Valid values for volume type extra specs
+    # The first value in the list is the default value
+    valid_prov_values = ['thin', 'full', 'dedup']
+
+    valid_persona_values = ['2 - Generic-ALUA',
+                            '1 - Generic',
+                            '3 - Generic-legacy',
+                            '4 - HPUX-legacy',
+                            '5 - AIX-legacy',
+                            '6 - EGENERA',
+                            '7 - ONTAP-legacy',
+                            '8 - VMware',
+                            '9 - OpenVMS',
+                            '10 - HPUX',
+                            '11 - WindowsServer']
+
+
+    # v2 replication constants
+    SYNC = 1
+    PERIODIC = 2
+    EXTRA_SPEC_REP_MODE = "replication:mode"
+    EXTRA_SPEC_REP_SYNC_PERIOD = "replication:sync_period"
+    RC_ACTION_CHANGE_TO_PRIMARY = 7
+    DEFAULT_REP_MODE = 'periodic'
+    DEFAULT_SYNC_PERIOD = 900
+    RC_GROUP_STARTED = 3
+    SYNC_STATUS_COMPLETED = 3
+    FAILBACK_VALUE = 'default'
+
 
     def __init__(self, api_url, debug=False, secure=False, timeout=None,
                  suppress_ssl_warnings=False):
@@ -5373,4 +5410,372 @@ class HPE3ParClient(object):
                              " belongs to different host: %(vlun_host)s",
                              {'lun': vlun['lun'],
                               'vlun_host': vlun.get('hostname', 'Unknown')})
+                
+
+    
+    def _check_license_enabled(self, systemVersion, valid_licenses,
+                               license_to_check, capability):
+        """Check a license against valid licenses on the array."""
+        major_minor = systemVersion.split('.')
+        if int(major_minor[0]) == 10 and int(major_minor[1]) >= 5:
+            return True
+        else:
+            if valid_licenses:
+                for license in valid_licenses:
+                    if license_to_check in license.get('name'):
+                        return True
+                    logger.debug("'%(capability)s' requires a '%(license)s' "
+                          "license which is not installed.",
+                            {'capability': capability,
+                            'license': license_to_check})
+                return False
+
+    
+    @staticmethod
+    def _encode_name(name):
+        uuid_str = name.replace("-", "")
+        vol_uuid = uuid.UUID('urn:uuid:%s' % uuid_str)
+        vol_encoded = base64.encode_as_text(vol_uuid.bytes)
+
+        # 3par doesn't allow +, nor /
+        vol_encoded = vol_encoded.replace('+', '.')
+        vol_encoded = vol_encoded.replace('/', '-')
+        # strip off the == as 3par doesn't like those.
+        vol_encoded = vol_encoded.replace('=', '')
+        return vol_encoded
+
+    
+    def _get_3par_ums_name(self, snapshot_id):
+        ums_name = self._encode_name(snapshot_id)
+        return "ums-%s" % ums_name
+
+    
+    def _get_3par_vvs_name(self, volume_id):
+        vvs_name = self._encode_name(volume_id)
+        return "vvs-%s" % vvs_name
+
+    
+    def _get_3par_unm_name(self, volume_id):
+        unm_name = self._encode_name(volume_id)
+        return "unm-%s" % unm_name   
+
+
+    def _get_existing_volume_ref_name_client(self, existing_ref, is_snapshot):
+        """Returns the volume name of an existing reference.
+
+        Checks if an existing volume reference has a source-name or
+        source-id element. If source-name or source-id is not present an
+        error will be thrown.
+        """
+        vol_name = None
+        if 'source-name' in existing_ref:
+            vol_name = existing_ref['source-name']
+        elif 'source-id' in existing_ref:
+            if is_snapshot:
+                vol_name = self._get_3par_ums_name(existing_ref['source-id'])
+            else:
+                vol_name = self._get_3par_unm_name(existing_ref['source-id'])
+        else:
+            reason = "Reference must contain source-name or source-id."
+            raise exceptions.ClientException(reason)
+        return vol_name  
+
+
+    def _get_3par_vol_comment_value(self, vol_comment, key):
+        comment_dict = dict(ast.literal_eval(vol_comment))
+        if key in comment_dict:
+            return comment_dict[key]
+        return None
+
+
+    @staticmethod
+    def _add_name_id_to_comment(comment, volume):
+        name_id = volume.get('_name_id')
+        if name_id:
+            comment['_name_id'] = name_id
+
+
+
+    def _get_3par_snap_name(self, snapshot_id, temp_snap=False):
+        snapshot_name = self._encode_name(snapshot_id)
+        if temp_snap:
+            # is this a temporary snapshot
+            # this is done during cloning
+            prefix = "tss-%s"
+        else:
+            prefix = "oss-%s"
+        return prefix % snapshot_name
+
+
+
+    def is_volume_group_snap_type(self, volume_type):
+        consis_group_snap_type = False
+        if volume_type:
+            extra_specs = volume_type.get('extra_specs')
+            if 'consistent_group_snapshot_enabled' in extra_specs:
+                gsnap_val = extra_specs['consistent_group_snapshot_enabled']
+                consis_group_snap_type = (gsnap_val == "<is> True")
+        return consis_group_snap_type
+
+
+    def _is_volume_type_replicated(self, volume_type):
+        replicated_type = False
+        extra_specs = volume_type.get('extra_specs')
+        if extra_specs and 'replication_enabled' in extra_specs:
+            rep_val = extra_specs['replication_enabled']
+            replicated_type = (rep_val == "<is> True")
+
+        return replicated_type
+
+    
+    def _get_3par_rcg_name_of_group(self, group_id):
+        rcg_name = self._encode_name(group_id)
+        rcg = "rcg-%s" % rcg_name
+        return rcg[:22]                     
+
+
+
+    def _get_3par_remote_rcg_name_of_group(self, group_id, provider_location):
+        return self._get_3par_rcg_name_of_group(group_id) + ".r" + (
+            str(provider_location))
+    
+
+    def _get_keys_by_volume_type(self, volume_type):
+        hpe3par_keys = {}
+        specs = volume_type.get('extra_specs')
+        for key, value in specs.items():
+            if ':' in key:
+                fields = key.split(':')
+                key = fields[1]
+            if key in self.hpe3par_valid_keys:
+                hpe3par_keys[key] = value
+        return hpe3par_keys
+    
+
+    def _get_hpe3par_tiramisu_value(self, volume_type):
+        hpe3par_tiramisu = False
+        hpe3par_keys = self._get_keys_by_volume_type(volume_type)
+        if hpe3par_keys.get('group_replication'):
+            hpe3par_tiramisu = (
+                hpe3par_keys['group_replication'] == "<is> True")
+
+        return hpe3par_tiramisu
+
+
+    def _get_key_value(self, hpe3par_keys, key, default=None):
+        if hpe3par_keys is not None and key in hpe3par_keys:
+            return hpe3par_keys[key]
+        else:
+            return default
+        
+
+    def _get_boolean_key_value(self, hpe3par_keys, key, default=False):
+        value = self._get_key_value(
+            hpe3par_keys, key, default)
+        if isinstance(value, str):
+            if value.lower() == 'true':
+                value = True
+            else:
+                value = False
+        return value
+    
+
+    def _get_3par_vol_comment(self, volume_name):
+        vol = self.getVolume(volume_name)
+        if 'comment' in vol:
+            return vol['comment']
+        return None
+    
+
+    def _get_remote_copy_mode_num(self, mode):
+        ret_mode = None
+        if mode == "sync":
+            ret_mode = self.SYNC
+        if mode == "periodic":
+            ret_mode = self.PERIODIC
+        return ret_mode
+    
+
+    def _get_replication_mode_from_volume_type(self, volume_type):
+        # Default replication mode is PERIODIC
+        replication_mode_num = self.PERIODIC
+        extra_specs = volume_type.get("extra_specs")
+        if extra_specs:
+            replication_mode = extra_specs.get(
+                self.EXTRA_SPEC_REP_MODE, self.DEFAULT_REP_MODE)
+
+            replication_mode_num = self._get_remote_copy_mode_num(
+                replication_mode)
+
+        return replication_mode_num
+    
+    def _is_replication_mode_correct(self, mode, sync_num):
+        rep_flag = True
+        # Make sure replication_mode is set to either sync|periodic.
+        mode = self._get_remote_copy_mode_num(mode)
+        if not mode:
+            logger.error("Extra spec replication:mode must be set and must "
+                      "be either 'sync' or 'periodic'.")
+            rep_flag = False
+        else:
+            # If replication:mode is periodic, replication_sync_period must be
+            # set between 300 - 31622400 seconds.
+            if mode == self.PERIODIC and (
+               sync_num < 300 or sync_num > 31622400):
+                logger.error("Extra spec replication:sync_period must be "
+                          "greater than 299 and less than 31622401 "
+                          "seconds.")
+                rep_flag = False
+        return rep_flag
+    
+
+    def _are_targets_in_their_natural_direction(self, rcg):
+
+        targets = rcg['targets']
+        for target in targets:
+            if target['roleReversed'] or (
+               target['state'] != self.RC_GROUP_STARTED):
+                return False
+
+        # Make sure all volumes are fully synced.
+        volumes = rcg['volumes']
+        for volume in volumes:
+            remote_volumes = volume['remoteVolumes']
+            for remote_volume in remote_volumes:
+                if remote_volume['syncStatus'] != (
+                   self.SYNC_STATUS_COMPLETED):
+                    return False
+        return True
+    
+
+    def _is_group_in_remote_copy_group(self, group):
+        rcg_name = self._get_3par_rcg_name_of_group(group.id)
+        try:
+            self.getRemoteCopyGroup(rcg_name)
+            return True
+        except exceptions.HTTPNotFound:
+            return False
+        
+
+    def _get_cpg_from_cpg_map(self, cpg_map, target_cpg):
+        ret_target_cpg = None
+        cpg_pairs = cpg_map.split(' ')
+        for cpg_pair in cpg_pairs:
+            cpgs = cpg_pair.split(':')
+            cpg = cpgs[0]
+            dest_cpg = cpgs[1]
+            if cpg == target_cpg:
+                ret_target_cpg = dest_cpg
+
+        return ret_target_cpg
+    
+
+    def _generate_hpe3par_cpgs(self, cpg_map):
+        hpe3par_cpgs = []
+        cpg_pairs = cpg_map.split(' ')
+        for cpg_pair in cpg_pairs:
+            cpgs = cpg_pair.split(':')
+            hpe3par_cpgs.append(cpgs[1])
+
+        return hpe3par_cpgs
+    
+
+    def disable_replication_client(self, group, volumes):
+        """Disable replication for a group.
+
+        :param group: the group object
+        :param volumes: the list of volumes
+        :returns: model_update, None
+        """
+
+        model_update = {}
+        if not group.is_replicated:
+            raise NotImplementedError()
+
+        if not volumes:
+            # Return if empty group
+            return model_update
+
+        try:
+            vvs_name = self._get_3par_vvs_name(group.id)
+            rcg_name = self._get_3par_rcg_name_of_group(group.id)
+
+            # Check VV and RCG exist on 3par,
+            # if RCG exist then stop RCG
+            self.getVolumeSet(vvs_name)
+            self.stopRemoteCopy(rcg_name)
+        except exceptions.HTTPNotFound as ex:
+            # The remote-copy group does not exist or
+            # set does not exist.
+            raise ex
+        except Exception as ex:
+            logger.error("Error disabling replication on group %(group)s. "
+                      "Exception received: %(e)s.",
+                      {'group': group.id, 'e': ex})
+            raise exceptions.ClientException(group_id=group.id)
+
+        return model_update
+    
+
+
+    def enable_replication_client(self, group, volumes):
+        """Enable replication for a group.
+
+        :param group: the group object
+        :param volumes: the list of volumes
+        :returns: model_update, None
+        """
+
+        model_update = {}
+        if not group.is_replicated:
+            raise NotImplementedError()
+
+        if not volumes:
+            # Return if empty group
+            return model_update
+
+        try:
+            vvs_name = self._get_3par_vvs_name(group.id)
+            rcg_name = self._get_3par_rcg_name_of_group(group.id)
+
+            # Check VV and RCG exist on 3par,
+            # if RCG exist then start RCG
+            self.getVolumeSet(vvs_name)
+            self.startRemoteCopy(rcg_name)
+        except exceptions.HTTPNotFound as ex:
+            # The remote-copy group does not exist or
+            # set does not exist.
+            raise ex
+        except exceptions.HTTPForbidden as ex:
+            # The remote-copy group has already been started.
+            raise ex
+        except Exception as ex:
+            logger.error("Error enabling replication on group %(group)s. "
+                      "Exception received: %(e)s.",
+                      {'group': group.id, 'e': ex})
+            raise exceptions.ClientException(group_id=group.id)
+
+        return model_update
+    
+
+    def _get_replication_sync_period_from_volume_type_client(self, volume_type):
+        # Default replication sync period is 900s
+        replication_sync_period = self.DEFAULT_SYNC_PERIOD
+        rep_mode = self.DEFAULT_REP_MODE
+        extra_specs = volume_type.get("extra_specs")
+        if extra_specs:
+            replication_sync_period = extra_specs.get(
+                self.EXTRA_SPEC_REP_SYNC_PERIOD, self.DEFAULT_SYNC_PERIOD)
+
+            replication_sync_period = int(replication_sync_period)
+            if not self._is_replication_mode_correct(rep_mode,
+                                                     replication_sync_period):
+                raise exceptions.ClientException()
+            
+        return replication_sync_period
+    
+    
+    
+
+    
 
