@@ -241,6 +241,8 @@ class HPE3ParClient(object):
     SYNC_STATUS_COMPLETED = 3
     FAILBACK_VALUE = 'default'
 
+    DEFAULT_ISCSI_PORT = 3260
+
 
     def __init__(self, api_url, debug=False, secure=False, timeout=None,
                  suppress_ssl_warnings=False):
@@ -5540,18 +5542,6 @@ class HPE3ParClient(object):
             str(provider_location))
     
 
-    def _get_keys_by_volume_type(self, volume_type):
-        hpe3par_keys = {}
-        specs = volume_type.get('extra_specs')
-        for key, value in specs.items():
-            if ':' in key:
-                fields = key.split(':')
-                key = fields[1]
-            if key in self.hpe3par_valid_keys:
-                hpe3par_keys[key] = value
-        return hpe3par_keys
-    
-
     def _get_hpe3par_tiramisu_value(self, volume_type):
         hpe3par_tiramisu = False
         hpe3par_keys = self._get_keys_by_volume_type(volume_type)
@@ -5774,8 +5764,238 @@ class HPE3ParClient(object):
             
         return replication_sync_period
     
-    
+
+    # v2 replication conversion
+    def _get_3par_rcg_name_client(self, volume, vol_name=None):
+        # if non-replicated volume is retyped or migrated to replicated vol,
+        # then rcg_name is different. Try to get that new rcg_name.
+        if volume['migration_status'] == 'success':
+            vol_details = self.getVolume(vol_name)
+            rcg_name = vol_details.get('rcopyGroup')
+            return rcg_name
+        else:
+            # by default, rcg_name is similar to volume name
+            rcg_name = self._encode_name(volume.get('_name_id')
+                                         or volume['id'])
+            rcg = "rcg-%s" % rcg_name
+            return rcg[:22]
     
 
+    def getStorageSystemIdName(self):
+        info = self.getStorageSystemInfo()
+
+        return info['id'], info['name']
     
 
+    def getWsApiVersionBuild(self):
+        info = self.getWsApiVersion()
+
+        return info['build']
+    
+    
+    def check_replication_flags_client(self, options):
+        required_flags = ['hpe3par_api_url', 'hpe3par_username',
+                          'hpe3par_password', 'san_ip', 'san_login',
+                          'san_password', 'backend_id',
+                          'replication_mode', 'cpg_map']
+        
+        for flag in required_flags:
+            if not options.get(flag, None):
+                msg = (('%s is not set and is required for the replication '
+                         'device to be valid.') % flag)
+                logger.error(msg)
+                raise exceptions.ClientException(desc=msg)
+            
+
+    def initialize_iscsi_ports_client(self, ip_addr):
+        temp_iscsi_ip = {}
+
+        if "." in ip_addr:
+            # v4
+            ip = ip_addr.split(':')
+            if len(ip) == 1:
+                temp_iscsi_ip[ip_addr] = (
+                    {'ip_port': self.DEFAULT_ISCSI_PORT})
+            elif len(ip) == 2:
+                temp_iscsi_ip[ip[0]] = {'ip_port': ip[1]}
+        elif ":" in ip_addr:
+            # v6
+            if "]" in ip_addr:
+                ip = ip_addr.split(']:')
+                ip_addr_v6 = ip[0]
+                ip_addr_v6 = ip_addr_v6.strip('[')
+                port_v6 = ip[1]
+                temp_iscsi_ip[ip_addr_v6] = {'ip_port': port_v6}
+            else:
+                temp_iscsi_ip[ip_addr] = (
+                    {'ip_port': self.DEFAULT_ISCSI_PORT})
+        else:
+            logger.warning("Invalid IP address format '%s'", ip_addr)
+
+        return temp_iscsi_ip
+    
+
+
+    def get_active_target_ports_client(self, remote_client=None):
+        if remote_client:
+            client_obj = remote_client
+            ports = client_obj.getPorts()
+        else:
+            client_obj = self
+            ports = client_obj.get_ports()
+
+        target_ports = []
+        for port in ports['members']:
+            if (
+                port['mode'] == client_obj.PORT_MODE_TARGET and
+                port['linkState'] == client_obj.PORT_STATE_READY
+            ):
+                port['nsp'] = self.build_nsp(port['portPos'])
+                target_ports.append(port)
+
+        return target_ports
+    
+
+    def build_nsp(self, portPos):
+        return '%s:%s:%s' % (portPos['node'],
+                             portPos['slot'],
+                             portPos['cardPort'])
+
+
+
+    def get_active_iscsi_target_ports_client(self, remote_client=None):
+        ports = self.get_active_target_ports_client(remote_client)
+        if remote_client:
+            client_obj = remote_client
+        else:
+            client_obj = self
+
+        iscsi_ports = []
+        for port in ports:
+            if port['protocol'] == client_obj.PORT_PROTO_ISCSI:
+                iscsi_ports.append(port)
+
+        return iscsi_ports
+    
+
+    def update_dicts_client(self, temp_iscsi_ip, iscsi_ip_list, iscsi_ports):
+        for port in iscsi_ports:
+            ip = port['IPAddr']
+            if ip in temp_iscsi_ip:
+                self._update_dicts(temp_iscsi_ip, iscsi_ip_list, ip, port)
+
+            if 'iSCSIVlans' in port:
+                for vip in port['iSCSIVlans']:
+                    ip = vip['IPAddr']
+                    if ip in temp_iscsi_ip:
+                        logger.debug("vlan ip: %(ip)s", {'ip': ip})
+                        self._update_dicts(temp_iscsi_ip, iscsi_ip_list,
+                                           ip, port)
+
+        return iscsi_ip_list, temp_iscsi_ip
+
+
+    def _update_dicts(self, temp_iscsi_ip, iscsi_ip_list, ip, port):
+        ip_port = temp_iscsi_ip[ip]['ip_port']
+        iscsi_ip_list[ip] = {'ip_port': ip_port,
+                             'nsp': port['nsp'],
+                             'iqn': port['iSCSIName']}
+        del temp_iscsi_ip[ip]
+
+
+    def getCPGDomain(self, cpg):
+        cpg_obj = self.getCPG(cpg)
+        if 'domain' in cpg_obj:
+            return cpg_obj['domain']
+
+        return None
+    
+
+    def getVolumeWithCPG(self, volume_name, allowSnap=False):
+        vol = self.getVolume(volume_name)
+        # Search for 'userCPG' in the get volume REST API,
+        # if found return userCPG , else search for snapCPG attribute
+        # when allowSnap=True. For the cases where 3PAR REST call for
+        # get volume doesn't have either userCPG or snapCPG ,
+        # take the default value of cpg from 'host' attribute from volume param
+        logger.debug("get volume response is: %s", vol)
+        if 'userCPG' in vol:
+            return vol['userCPG']
+        elif allowSnap and 'snapCPG' in vol:
+            return vol['snapCPG']
+        
+    
+    def _get_prioritized_host_on_3par_client(self, host, hosts, hostname):
+        # Check whether host with wwn/iqn of initiator present on 3par
+        if hosts and hosts['members'] and 'name' in hosts['members'][0]:
+            # Retrieving 'host' and 'hosts' from 3par using hostname
+            # and wwn/iqn respectively. Compare hostname of 'host' and 'hosts',
+            # if they do not match it means 3par has a pre-existing host
+            # with some other name.
+            if host['name'] != hosts['members'][0]['name']:
+                hostname = hosts['members'][0]['name']
+                logger.info(("Prioritize the host retrieved from wwn/iqn "
+                          "Hostname : %(hosts)s  is used instead "
+                          "of Hostname: %(host)s"),
+                         {'hosts': hostname,
+                          'host': host['name']})
+                host = self.getHost(hostname)
+                return host, hostname
+
+        return host, hostname
+    
+    
+    def queryHostReturnHostname(self, iscsi_iqn):
+        hosts = self.queryHost(iqns=iscsi_iqn)
+
+        if hosts and hosts['members'] and 'name' in hosts['members'][0]:
+            return hosts['members'][0]['name']
+        else:
+            return None
+        
+
+    def hostNameFromHost(self, host):
+        if host and 'name' in host:
+            return host['name']
+        else:
+            return None
+
+    def volumeNameForVLun(self, vlun):
+        return vlun['volumeName']
+    
+
+    def iscsi_ip_port(self, port):
+        if port and 'IPAddr' in port:
+            return port['IPAddr']
+        else:
+            return None
+        
+
+    def vlunPortPos(self, vlun):
+        return vlun['portPos']
+    
+
+    def create_vlun_info(self, location):
+        vlun_info = None
+        if location:
+            # The LUN id is returned as part of the location URI
+            vlun = location.split(',')
+            vlun_info = {'volume_name': vlun[0],
+                         'lun_id': int(vlun[1]),
+                         'host_name': vlun[2],
+                         }
+            if len(vlun) > 3:
+                vlun_info['nsp'] = vlun[3]
+            
+        return vlun_info
+    
+    
+    def get_vlun_info(self, vlun):
+        return vlun['volumeName'], vlun['lun'], vlun['portPos']
+    
+
+    def get_iSCSIVlans_Port(self, port):
+        return 'iSCSIVlans' in port, port['iSCSIVlans']
+    
+    def get_vlan_ip(self, vip):
+        return vip['IPAddr']
