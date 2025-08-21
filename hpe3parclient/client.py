@@ -5945,8 +5945,11 @@ class HPE3ParClient(object):
         return host, hostname
     
     
-    def queryHostReturnHostname(self, iscsi_iqn):
-        hosts = self.queryHost(iqns=iscsi_iqn)
+    def queryHostReturnHostname(self, iscsi_iqn=None, wwns=None):
+        if iscsi_iqn is not None:
+            hosts = self.queryHost(iqns=iscsi_iqn)
+        elif wwns is not None:
+            hosts = self.queryHost(wwns=wwns)
 
         if hosts and hosts['members'] and 'name' in hosts['members'][0]:
             return hosts['members'][0]['name']
@@ -5999,3 +6002,42 @@ class HPE3ParClient(object):
     
     def get_vlan_ip(self, vip):
         return vip['IPAddr']
+    
+
+    def get_host_wwns(self, host):
+        host_wwns = []
+
+        if 'FCPaths' in host:
+            for path in host['FCPaths']:
+                wwn = path.get('wwn', None)
+                if wwn is not None:
+                    host_wwns.append(wwn.lower())
+
+        return host_wwns
+    
+
+    def create_mod_request(self, iscsi_iqn=None, wwn=None):
+        mod_request = {}
+
+        if iscsi_iqn is not None:
+            mod_request = {'pathOperation': self.HOST_EDIT_ADD,
+                       'iSCSINames': [iscsi_iqn]}
+        elif wwn is not None:
+            mod_request = {'pathOperation': self.HOST_EDIT_ADD,
+                       'FCWWNs': wwn}
+            
+        return mod_request
+    
+
+    def host_iscsi_info(self, host):
+        return 'iSCSIPaths' not in host, len(host['iSCSIPaths']), host['initiatorChapEnabled']
+    
+
+    def create_mod_host_chap_request(self, username, password):
+        mod_request = {'chapOperation': self.HOST_EDIT_ADD,
+                       'chapOperationMode': self.CHAP_INITIATOR,
+                       'chapName': username,
+                       'chapSecret': password}
+        
+        return mod_request
+        
